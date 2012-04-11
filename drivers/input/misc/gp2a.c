@@ -394,9 +394,16 @@ irqreturn_t gp2a_irq_handler(int irq, void *data)
 	pr_err("gp2a: proximity val = %d\n", val);
 
 #ifdef CONFIG_TOUCH_WAKE
-    if (!val) {
-        proximity_detected();
-    }
+
+	if (!val)
+	    {
+		proximity_detected();
+
+	}
+	else {
+		proximity_off();
+	}
+
 #endif
 
 	/* 0 is close, 1 is far */
