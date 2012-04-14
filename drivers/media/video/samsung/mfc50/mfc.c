@@ -460,7 +460,7 @@ static int mfc_mmap(struct file *filp, struct vm_area_struct *vma)
 		return -EINVAL;
 	}
 
-	mfc_ctx->port0_mmap_size = (vir_size / 2);
+	mfc_ctx->port0_mmap_size = mfc_port0_memsize - firmware_size;
 
 	vma->vm_flags |= VM_RESERVED | VM_IO;
 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
