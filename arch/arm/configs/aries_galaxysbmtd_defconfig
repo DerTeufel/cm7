@@ -2218,3 +2218,7 @@ CONFIG_TEXTSEARCH_FSM=y
 CONFIG_HAS_IOMEM=y
 CONFIG_HAS_DMA=y
 CONFIG_NLATTR=y
+
+
+############# devil ###############################
+CONFIG_FB_VOODOO=y
