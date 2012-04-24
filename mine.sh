@@ -13,7 +13,7 @@ scheduler="CFS"
 
 color="VC"
 
-light="LED"
+light="BLN"
 if [ "$mem" = "cm" ]
 then
 version="$build"_"$scheduler"_"$light"_"$color"
