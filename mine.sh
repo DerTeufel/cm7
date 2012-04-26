@@ -11,7 +11,7 @@ build="Devil_CM7_0.07""$rom"_"$handy"
 
 scheduler="CFS"
 
-color="CMC"
+color="VC"
 
 light="BLN"
 if [ "$mem" = "cm" ]
