@@ -57,7 +57,7 @@ config S5PV210_POWER_DOMAIN
 config S5PV210_CORESIGHT
 	bool "Coresight"
 	select OC_ETM
-	default y
+	default n
 	help
 	  Support embedded trace cell
 
@@ -275,9 +275,11 @@ config DVFS_LIMIT
 	default n
 
 config CPU_DIDLE
-	bool "DEEP Idle"
-	depends on CPU_IDLE
-	default y
+  bool "Enable DEEP IDLE support for S5PV210 CPU"
+   depends on CPU_IDLE
+  default y
+  help
+    Enable DEEP IDLE support for S5PV210 CPU.
 
 
 config WIFI_CONTROL_FUNC

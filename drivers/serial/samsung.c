@@ -449,6 +449,16 @@ static int s3c24xx_serial_startup(struct uart_port *port)
 
 /* power power management control */
 
+#ifdef CONFIG_CPU_DIDLE
+static bool gps_running = false;
+
+bool gps_is_running(void)
+{
+    return gps_running;
+}
+EXPORT_SYMBOL(gps_is_running);
+#endif
+
 static void s3c24xx_serial_pm(struct uart_port *port, unsigned int level,
 			      unsigned int old)
 {
@@ -462,6 +472,10 @@ static void s3c24xx_serial_pm(struct uart_port *port, unsigned int level,
 		disable_irq(ourport->rx_irq);
 
 		if (!IS_ERR(ourport->baudclk) && ourport->baudclk != NULL)
+#ifdef CONFIG_CPU_DIDLE
+    if (ourport->port.irq == IRQ_S3CUART_RX1) 
+        gps_running = false;
+#endif
 			clk_disable(ourport->baudclk);
 
 		clk_disable(ourport->clk);
@@ -471,7 +485,11 @@ static void s3c24xx_serial_pm(struct uart_port *port, unsigned int level,
 		clk_enable(ourport->clk);
 
 		if (!IS_ERR(ourport->baudclk) && ourport->baudclk != NULL)
-			clk_enable(ourport->baudclk);
+clk_enable(ourport->clk);
+#ifdef CONFIG_CPU_DIDLE
+    if (ourport->port.irq == IRQ_S3CUART_RX1)
+        gps_running = true;
+#endif
 
 		enable_irq(ourport->tx_irq);
 		enable_irq(ourport->rx_irq);
