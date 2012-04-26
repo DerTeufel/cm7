@@ -23,14 +23,15 @@
 #include <linux/tick.h>
 #include <linux/ktime.h>
 #include <linux/sched.h>
+#include <linux/earlysuspend.h>
 
 /*
  * dbs is used in this file as a shortform for demandbased switching
  * It helps to keep variable names smaller, simpler
  */
 
-#define DEF_FREQUENCY_UP_THRESHOLD		(80)
-#define DEF_FREQUENCY_DOWN_THRESHOLD		(20)
+#define DEF_FREQUENCY_UP_THRESHOLD		(75)
+#define DEF_FREQUENCY_DOWN_THRESHOLD		(30)
 
 /*
  * The polling frequency of this governor depends on the capability of
@@ -46,11 +47,20 @@
 
 static unsigned int min_sampling_rate;
 
+static unsigned int sampling_rate_awake;
+static unsigned int up_threshold_awake;
+static unsigned int down_threshold_awake;
+#define SAMPLING_RATE_SLEEP_MULTIPLIER (3)
+#define UP_THRESHOLD_AT_SLEEP    (95)
+#define DOWN_THRESHOLD_AT_SLEEP	 (50)
+
 #define LATENCY_MULTIPLIER			(1000)
 #define MIN_LATENCY_MULTIPLIER			(100)
 #define DEF_SAMPLING_DOWN_FACTOR		(1)
 #define MAX_SAMPLING_DOWN_FACTOR		(10)
 #define TRANSITION_LATENCY_LIMIT		(10 * 1000 * 1000)
+#define UP_THRESHOLD_AT_MIN_FREQ    (100)
+#define FREQ_FOR_RESPONSIVENESS      (400000)
 
 static void do_dbs_timer(struct work_struct *work);
 
@@ -76,12 +86,9 @@ static DEFINE_PER_CPU(struct cpu_dbs_info_s, cs_cpu_dbs_info);
 static unsigned int dbs_enable;	/* number of CPUs using this policy */
 
 /*
- * dbs_mutex protects data in dbs_tuners_ins from concurrent changes on
- * different CPUs. It protects dbs_enable in governor start/stop.
+ * dbs_mutex protects dbs_enable in governor start/stop.
  */
 static DEFINE_MUTEX(dbs_mutex);
-
-static struct workqueue_struct	*kconservative_wq;
 
 static struct dbs_tuners {
 	unsigned int sampling_rate;
@@ -90,12 +97,21 @@ static struct dbs_tuners {
 	unsigned int down_threshold;
 	unsigned int ignore_nice;
 	unsigned int freq_step;
+	unsigned int sleep_multiplier;
+	unsigned int up_threshold_min_freq;
+	unsigned int responsiveness_freq;
+
+	int early_suspend;
 } dbs_tuners_ins = {
+	.sleep_multiplier = SAMPLING_RATE_SLEEP_MULTIPLIER,
 	.up_threshold = DEF_FREQUENCY_UP_THRESHOLD,
 	.down_threshold = DEF_FREQUENCY_DOWN_THRESHOLD,
 	.sampling_down_factor = DEF_SAMPLING_DOWN_FACTOR,
 	.ignore_nice = 0,
 	.freq_step = 5,
+	.up_threshold_min_freq= UP_THRESHOLD_AT_MIN_FREQ,
+	.responsiveness_freq= FREQ_FOR_RESPONSIVENESS, 
+	.early_suspend = -1,
 };
 
 static inline cputime64_t get_cpu_idle_time_jiffy(unsigned int cpu,
@@ -118,7 +134,7 @@ static inline cputime64_t get_cpu_idle_time_jiffy(unsigned int cpu,
 	if (wall)
 		*wall = (cputime64_t)jiffies_to_usecs(cur_wall_time);
 
-	return (cputime64_t)jiffies_to_usecs(idle_time);;
+	return (cputime64_t)jiffies_to_usecs(idle_time);
 }
 
 static inline cputime64_t get_cpu_idle_time(unsigned int cpu, cputime64_t *wall)
@@ -164,21 +180,12 @@ static struct notifier_block dbs_cpufreq_notifier_block = {
 };
 
 /************************** sysfs interface ************************/
-static ssize_t show_sampling_rate_max(struct kobject *kobj,
-				      struct attribute *attr, char *buf)
-{
-	printk_once(KERN_INFO "CPUFREQ: conservative sampling_rate_max "
-		    "sysfs file is deprecated - used by: %s\n", current->comm);
-	return sprintf(buf, "%u\n", -1U);
-}
-
 static ssize_t show_sampling_rate_min(struct kobject *kobj,
 				      struct attribute *attr, char *buf)
 {
 	return sprintf(buf, "%u\n", min_sampling_rate);
 }
 
-define_one_global_ro(sampling_rate_max);
 define_one_global_ro(sampling_rate_min);
 
 /* cpufreq_conservative Governor Tunables */
@@ -194,33 +201,55 @@ show_one(up_threshold, up_threshold);
 show_one(down_threshold, down_threshold);
 show_one(ignore_nice_load, ignore_nice);
 show_one(freq_step, freq_step);
+show_one(sleep_multiplier, sleep_multiplier);
+show_one(up_threshold_min_freq, up_threshold_min_freq);
+show_one(responsiveness_freq, responsiveness_freq);
 
-/*** delete after deprecation time ***/
-#define DEPRECATION_MSG(file_name)					\
-	printk_once(KERN_INFO "CPUFREQ: Per core conservative sysfs "	\
-		"interface is deprecated - " #file_name "\n");
+static ssize_t store_sleep_multiplier(struct kobject *a, struct attribute *b,
+				  const char *buf, size_t count)
+{
+	unsigned int input;
+	int ret;
+	ret = sscanf(buf, "%u", &input);
 
-#define show_one_old(file_name)						\
-static ssize_t show_##file_name##_old					\
-(struct cpufreq_policy *unused, char *buf)				\
-{									\
-	printk_once(KERN_INFO "CPUFREQ: Per core conservative sysfs "	\
-		"interface is deprecated - " #file_name "\n");		\
-	return show_##file_name(NULL, NULL, buf);			\
+	if (ret != 1 || input < 1 ||
+			input > 10) {
+		return -EINVAL;
+	}
+	dbs_tuners_ins.sleep_multiplier = input;
+	return count;
 }
-show_one_old(sampling_rate);
-show_one_old(sampling_down_factor);
-show_one_old(up_threshold);
-show_one_old(down_threshold);
-show_one_old(ignore_nice_load);
-show_one_old(freq_step);
-show_one_old(sampling_rate_min);
-show_one_old(sampling_rate_max);
 
-cpufreq_freq_attr_ro_old(sampling_rate_min);
-cpufreq_freq_attr_ro_old(sampling_rate_max);
+static ssize_t store_up_threshold_min_freq(struct kobject *a, struct attribute *b,
+				  const char *buf, size_t count)
+{
+	unsigned int input;
+	int ret;
+	ret = sscanf(buf, "%u", &input);
 
-/*** delete after deprecation time ***/
+	if (ret != 1 || input > 100 ||
+			input <= dbs_tuners_ins.down_threshold)
+		return -EINVAL;
+
+	dbs_tuners_ins.up_threshold_min_freq = input;
+	return count;
+}
+
+
+static ssize_t store_responsiveness_freq(struct kobject *a, struct attribute *b,
+				  const char *buf, size_t count)
+{
+	unsigned int input;
+	int ret;
+	ret = sscanf(buf, "%u", &input);
+
+	if (ret != 1 || input > 1400000 ||
+			input < 100000) {
+		return -EINVAL;
+	}
+	dbs_tuners_ins.responsiveness_freq = input;
+	return count;
+}
 
 static ssize_t store_sampling_down_factor(struct kobject *a,
 					  struct attribute *b,
@@ -233,10 +262,7 @@ static ssize_t store_sampling_down_factor(struct kobject *a,
 	if (ret != 1 || input > MAX_SAMPLING_DOWN_FACTOR || input < 1)
 		return -EINVAL;
 
-	mutex_lock(&dbs_mutex);
 	dbs_tuners_ins.sampling_down_factor = input;
-	mutex_unlock(&dbs_mutex);
-
 	return count;
 }
 
@@ -250,10 +276,7 @@ static ssize_t store_sampling_rate(struct kobject *a, struct attribute *b,
 	if (ret != 1)
 		return -EINVAL;
 
-	mutex_lock(&dbs_mutex);
 	dbs_tuners_ins.sampling_rate = max(input, min_sampling_rate);
-	mutex_unlock(&dbs_mutex);
-
 	return count;
 }
 
@@ -264,16 +287,11 @@ static ssize_t store_up_threshold(struct kobject *a, struct attribute *b,
 	int ret;
 	ret = sscanf(buf, "%u", &input);
 
-	mutex_lock(&dbs_mutex);
 	if (ret != 1 || input > 100 ||
-			input <= dbs_tuners_ins.down_threshold) {
-		mutex_unlock(&dbs_mutex);
+			input <= dbs_tuners_ins.down_threshold)
 		return -EINVAL;
-	}
 
 	dbs_tuners_ins.up_threshold = input;
-	mutex_unlock(&dbs_mutex);
-
 	return count;
 }
 
@@ -284,17 +302,13 @@ static ssize_t store_down_threshold(struct kobject *a, struct attribute *b,
 	int ret;
 	ret = sscanf(buf, "%u", &input);
 
-	mutex_lock(&dbs_mutex);
 	/* cannot be lower than 11 otherwise freq will not fall */
 	if (ret != 1 || input < 11 || input > 100 ||
-			input >= dbs_tuners_ins.up_threshold) {
-		mutex_unlock(&dbs_mutex);
+			input >= dbs_tuners_ins.up_threshold ||
+			input >= dbs_tuners_ins.up_threshold_min_freq )
 		return -EINVAL;
-	}
 
 	dbs_tuners_ins.down_threshold = input;
-	mutex_unlock(&dbs_mutex);
-
 	return count;
 }
 
@@ -313,11 +327,9 @@ static ssize_t store_ignore_nice_load(struct kobject *a, struct attribute *b,
 	if (input > 1)
 		input = 1;
 
-	mutex_lock(&dbs_mutex);
-	if (input == dbs_tuners_ins.ignore_nice) { /* nothing to do */
-		mutex_unlock(&dbs_mutex);
+	if (input == dbs_tuners_ins.ignore_nice) /* nothing to do */
 		return count;
-	}
+
 	dbs_tuners_ins.ignore_nice = input;
 
 	/* we need to re-evaluate prev_cpu_idle */
@@ -329,8 +341,6 @@ static ssize_t store_ignore_nice_load(struct kobject *a, struct attribute *b,
 		if (dbs_tuners_ins.ignore_nice)
 			dbs_info->prev_cpu_nice = kstat_cpu(j).cpustat.nice;
 	}
-	mutex_unlock(&dbs_mutex);
-
 	return count;
 }
 
@@ -349,10 +359,7 @@ static ssize_t store_freq_step(struct kobject *a, struct attribute *b,
 
 	/* no need to test here if freq_step is zero as the user might actually
 	 * want this, they would be crazy though :) */
-	mutex_lock(&dbs_mutex);
 	dbs_tuners_ins.freq_step = input;
-	mutex_unlock(&dbs_mutex);
-
 	return count;
 }
 
@@ -362,9 +369,11 @@ define_one_global_rw(up_threshold);
 define_one_global_rw(down_threshold);
 define_one_global_rw(ignore_nice_load);
 define_one_global_rw(freq_step);
+define_one_global_rw(sleep_multiplier);
+define_one_global_rw(up_threshold_min_freq);
+define_one_global_rw(responsiveness_freq);
 
 static struct attribute *dbs_attributes[] = {
-	&sampling_rate_max.attr,
 	&sampling_rate_min.attr,
 	&sampling_rate.attr,
 	&sampling_down_factor.attr,
@@ -372,6 +381,9 @@ static struct attribute *dbs_attributes[] = {
 	&down_threshold.attr,
 	&ignore_nice_load.attr,
 	&freq_step.attr,
+	&sleep_multiplier.attr,
+	&up_threshold_min_freq.attr,
+	&responsiveness_freq.attr,
 	NULL
 };
 
@@ -379,49 +391,6 @@ static struct attribute_group dbs_attr_group = {
 	.attrs = dbs_attributes,
 	.name = "conservative",
 };
-
-/*** delete after deprecation time ***/
-
-#define write_one_old(file_name)					\
-static ssize_t store_##file_name##_old					\
-(struct cpufreq_policy *unused, const char *buf, size_t count)		\
-{									\
-	printk_once(KERN_INFO "CPUFREQ: Per core conservative sysfs "	\
-		"interface is deprecated - " #file_name "\n");	\
-	return store_##file_name(NULL, NULL, buf, count);		\
-}
-write_one_old(sampling_rate);
-write_one_old(sampling_down_factor);
-write_one_old(up_threshold);
-write_one_old(down_threshold);
-write_one_old(ignore_nice_load);
-write_one_old(freq_step);
-
-cpufreq_freq_attr_rw_old(sampling_rate);
-cpufreq_freq_attr_rw_old(sampling_down_factor);
-cpufreq_freq_attr_rw_old(up_threshold);
-cpufreq_freq_attr_rw_old(down_threshold);
-cpufreq_freq_attr_rw_old(ignore_nice_load);
-cpufreq_freq_attr_rw_old(freq_step);
-
-static struct attribute *dbs_attributes_old[] = {
-	&sampling_rate_max_old.attr,
-	&sampling_rate_min_old.attr,
-	&sampling_rate_old.attr,
-	&sampling_down_factor_old.attr,
-	&up_threshold_old.attr,
-	&down_threshold_old.attr,
-	&ignore_nice_load_old.attr,
-	&freq_step_old.attr,
-	NULL
-};
-
-static struct attribute_group dbs_attr_group_old = {
-	.attrs = dbs_attributes_old,
-	.name = "conservative",
-};
-
-/*** delete after deprecation time ***/
 
 /************************** sysfs end ************************/
 
@@ -433,6 +402,7 @@ static void dbs_check_cpu(struct cpu_dbs_info_s *this_dbs_info)
 
 	struct cpufreq_policy *policy;
 	unsigned int j;
+	int up_threshold = dbs_tuners_ins.up_threshold;
 
 	policy = this_dbs_info->cur_policy;
 
@@ -499,8 +469,15 @@ static void dbs_check_cpu(struct cpu_dbs_info_s *this_dbs_info)
 		return;
 
 	/* Check for frequency increase */
-	if (max_load > dbs_tuners_ins.up_threshold) {
-		this_dbs_info->down_skip = 0;
+
+	if(dbs_tuners_ins.up_threshold_min_freq != 100){
+		/* set up_threshold if freq below defined value */
+  		if (policy->cur < dbs_tuners_ins.responsiveness_freq && dbs_tuners_ins.early_suspend == -1)
+	     		up_threshold = dbs_tuners_ins.up_threshold_min_freq;
+	}
+
+	if (max_load > up_threshold) {
+			this_dbs_info->down_skip = 0;
 
 		/* if we are already at full speed then break out early */
 		if (this_dbs_info->requested_freq == policy->max)
@@ -560,7 +537,7 @@ static void do_dbs_timer(struct work_struct *work)
 
 	dbs_check_cpu(dbs_info);
 
-	queue_delayed_work_on(cpu, kconservative_wq, &dbs_info->work, delay);
+	schedule_delayed_work_on(cpu, &dbs_info->work, delay);
 	mutex_unlock(&dbs_info->timer_mutex);
 }
 
@@ -572,8 +549,7 @@ static inline void dbs_timer_init(struct cpu_dbs_info_s *dbs_info)
 
 	dbs_info->enable = 1;
 	INIT_DELAYED_WORK_DEFERRABLE(&dbs_info->work, do_dbs_timer);
-	queue_delayed_work_on(dbs_info->cpu, kconservative_wq, &dbs_info->work,
-				delay);
+	schedule_delayed_work_on(dbs_info->cpu, &dbs_info->work, delay);
 }
 
 static inline void dbs_timer_exit(struct cpu_dbs_info_s *dbs_info)
@@ -581,6 +557,35 @@ static inline void dbs_timer_exit(struct cpu_dbs_info_s *dbs_info)
 	dbs_info->enable = 0;
 	cancel_delayed_work_sync(&dbs_info->work);
 }
+
+static void powersave_early_suspend(struct early_suspend *handler)
+{
+  mutex_lock(&dbs_mutex);
+  dbs_tuners_ins.early_suspend = 1;
+  sampling_rate_awake = dbs_tuners_ins.sampling_rate;
+  dbs_tuners_ins.sampling_rate *= dbs_tuners_ins.sleep_multiplier;
+  up_threshold_awake = dbs_tuners_ins.up_threshold;
+  dbs_tuners_ins.up_threshold = UP_THRESHOLD_AT_SLEEP;
+  down_threshold_awake = dbs_tuners_ins.down_threshold;
+  dbs_tuners_ins.down_threshold = DOWN_THRESHOLD_AT_SLEEP;
+  mutex_unlock(&dbs_mutex);
+}
+
+static void powersave_late_resume(struct early_suspend *handler)
+{
+  mutex_lock(&dbs_mutex);
+  dbs_tuners_ins.early_suspend = -1;
+  dbs_tuners_ins.sampling_rate = sampling_rate_awake;
+  dbs_tuners_ins.up_threshold = up_threshold_awake;
+  dbs_tuners_ins.down_threshold = down_threshold_awake;
+  mutex_unlock(&dbs_mutex);
+}
+
+static struct early_suspend _powersave_early_suspend = {
+  .suspend = powersave_early_suspend,
+  .resume = powersave_late_resume,
+  .level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN,
+};
 
 static int cpufreq_governor_dbs(struct cpufreq_policy *policy,
 				   unsigned int event)
@@ -598,12 +603,6 @@ static int cpufreq_governor_dbs(struct cpufreq_policy *policy,
 			return -EINVAL;
 
 		mutex_lock(&dbs_mutex);
-
-		rc = sysfs_create_group(&policy->kobj, &dbs_attr_group_old);
-		if (rc) {
-			mutex_unlock(&dbs_mutex);
-			return rc;
-		}
 
 		for_each_cpu(j, policy->cpus) {
 			struct cpu_dbs_info_s *j_dbs_info;
@@ -644,14 +643,15 @@ static int cpufreq_governor_dbs(struct cpufreq_policy *policy,
 			 * conservative does not implement micro like ondemand
 			 * governor, thus we are bound to jiffes/HZ
 			 */
-			min_sampling_rate =
-				MIN_SAMPLING_RATE_RATIO * jiffies_to_usecs(10);
+			min_sampling_rate = 10000;
 			/* Bring kernel and HW constraints together */
-			min_sampling_rate = max(min_sampling_rate,
-					MIN_LATENCY_MULTIPLIER * latency);
+
 			dbs_tuners_ins.sampling_rate =
 				max(min_sampling_rate,
 				    latency * LATENCY_MULTIPLIER);
+            sampling_rate_awake = dbs_tuners_ins.sampling_rate;
+            up_threshold_awake = dbs_tuners_ins.up_threshold;
+            down_threshold_awake = dbs_tuners_ins.down_threshold; 
 
 			cpufreq_register_notifier(
 					&dbs_cpufreq_notifier_block,
@@ -660,14 +660,13 @@ static int cpufreq_governor_dbs(struct cpufreq_policy *policy,
 		mutex_unlock(&dbs_mutex);
 
 		dbs_timer_init(this_dbs_info);
-
+        register_early_suspend(&_powersave_early_suspend);
 		break;
 
 	case CPUFREQ_GOV_STOP:
 		dbs_timer_exit(this_dbs_info);
 
 		mutex_lock(&dbs_mutex);
-		sysfs_remove_group(&policy->kobj, &dbs_attr_group_old);
 		dbs_enable--;
 		mutex_destroy(&this_dbs_info->timer_mutex);
 
@@ -685,6 +684,7 @@ static int cpufreq_governor_dbs(struct cpufreq_policy *policy,
 			sysfs_remove_group(cpufreq_global_kobject,
 					   &dbs_attr_group);
 
+        unregister_early_suspend(&_powersave_early_suspend);
 		break;
 
 	case CPUFREQ_GOV_LIMITS:
@@ -716,25 +716,12 @@ struct cpufreq_governor cpufreq_gov_conservative = {
 
 static int __init cpufreq_gov_dbs_init(void)
 {
-	int err;
-
-	kconservative_wq = create_workqueue("kconservative");
-	if (!kconservative_wq) {
-		printk(KERN_ERR "Creation of kconservative failed\n");
-		return -EFAULT;
-	}
-
-	err = cpufreq_register_governor(&cpufreq_gov_conservative);
-	if (err)
-		destroy_workqueue(kconservative_wq);
-
-	return err;
+	return cpufreq_register_governor(&cpufreq_gov_conservative);
 }
 
 static void __exit cpufreq_gov_dbs_exit(void)
 {
 	cpufreq_unregister_governor(&cpufreq_gov_conservative);
-	destroy_workqueue(kconservative_wq);
 }
 
 

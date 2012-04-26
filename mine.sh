@@ -7,11 +7,11 @@ mem="cm"
 
 handy="i9000"
 
-build="Devil_CM7_0.06""$rom"_"$handy"
+build="Devil_CM7_0.07""$rom"_"$handy"
 
 scheduler="CFS"
 
-color="VC"
+color="CMC"
 
 light="BLN"
 if [ "$mem" = "cm" ]
